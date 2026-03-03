@@ -1,0 +1,2 @@
+model,precision,recall,f1,roc_auc
+One-Class SVM,0.8697,1.0,0.9303,0.9999

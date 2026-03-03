@@ -23,7 +23,6 @@ anomaly = df[df['label'] == 1]
 norm_patch = mpatches.Patch(color='steelblue', alpha=0.7, label='Normal')
 anom_patch = mpatches.Patch(color='crimson',   alpha=0.7, label='Anomaly')
 
-# ── Plot 1: Time series overview ─────────────────────────────────────────────
 fig, axes = plt.subplots(3, 1, figsize=(14, 11))
 key_metrics = [
     ('pss',      'PSS (kB)',    'Memory (PSS) over Wall Time'),
@@ -47,8 +46,6 @@ plt.tight_layout()
 plt.savefig(os.path.join(FIG, '01_timeseries_overview.png'), dpi=150)
 plt.close()
 
-# ── Plot 2: Feature distributions (KDE) ──────────────────────────────────────
-# Key features only — the ones with most separation
 key_feats = ['pss', 'nthreads', 'dpss_dt', 'cpu_eff',
              'stime_ratio', 'pss_per_proc', 'io_rate', 'pss_roll_std']
 
@@ -76,7 +73,6 @@ plt.tight_layout()
 plt.savefig(os.path.join(FIG, '02_feature_distributions.png'), dpi=150)
 plt.close()
 
-# ── Plot 3: Pairplot of top 4 most separating features ───────────────────────
 pair_feats = ['pss', 'nthreads', 'cpu_eff', 'pss_per_proc', 'label']
 pair_df = df[pair_feats].copy()
 pair_df['label'] = pair_df['label'].map({0: 'Normal', 1: 'Anomaly'})
@@ -89,7 +85,6 @@ g.figure.suptitle('Pairwise Feature Separability', y=1.02,
 g.figure.savefig(os.path.join(FIG, '03_pairplot.png'), dpi=130, bbox_inches='tight')
 plt.close()
 
-# ── Plot 4: Correlation heatmap ───────────────────────────────────────────────
 fig, ax = plt.subplots(figsize=(13, 10))
 corr = df[FEATURE_COLS + ['label']].corr()
 mask = np.zeros_like(corr, dtype=bool)
