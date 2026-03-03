@@ -27,9 +27,9 @@ FEATURE_COLS = [
     "pss_per_proc", "io_rate",
 ]
 
-TRAIN_RUNS = ["normal_mem_01", "normal_mem_02", "normal_mem_03", "normal_mem_04"]
-VAL_RUNS   = ["normal_cpu_01"]
-TEST_RUNS  = ["normal_io_01",
+TRAIN_RUNS = ["normal_mem_01", "normal_mem_02", "normal_mem_03"]
+VAL_RUNS   = ["normal_mem_04"]
+TEST_RUNS  = ["normal_cpu_01", "normal_io_01",
               "anomaly_mem_spike", "anomaly_thread_spike",
               "anomaly_combined",  "anomaly_io_burst"]
 
