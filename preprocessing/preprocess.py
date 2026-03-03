@@ -45,9 +45,6 @@ raw = pd.concat(frames, ignore_index=True)
 print(f"Raw combined shape: {raw.shape}")
 print(raw['label'].value_counts())
 
-# ── Feature Engineering ─────────────────────────────────────────────────────
-
-# Rate of PSS change (memory growth rate per second)
 raw['dpss_dt'] = (
     raw.groupby('run_id')['pss'].diff() /
     raw.groupby('run_id')['wtime'].diff().replace(0, np.nan)
@@ -73,7 +70,6 @@ raw['pss_roll_std'] = raw.groupby('run_id')['pss'].transform(
     lambda x: x.rolling(5, min_periods=1).std().fillna(0)
 )
 
-# Z-score of PSS relative to its rolling stats (used for z-score detector)
 raw['pss_zscore'] = (
     (raw['pss'] - raw['pss_roll_mean']) /
     raw['pss_roll_std'].clip(lower=1)
@@ -81,7 +77,6 @@ raw['pss_zscore'] = (
 
 raw = raw.fillna(0)
 
-# ── Final Feature Columns ────────────────────────────────────────────────────
 
 FEATURE_COLS = [
     'pss', 'rss', 'nthreads', 'nprocs',
@@ -93,10 +88,6 @@ FEATURE_COLS = [
 ]
 
 # ── Shuffle and Save ─────────────────────────────────────────────────────────
-# IMPORTANT: shuffle at run level, not row level.
-# Shuffling individual rows would break time-series order within each run.
-# Instead we shuffle the order in which runs appear in the dataset,
-# then within each run the rows remain time-ordered.
 
 run_ids = raw['run_id'].unique().tolist()
 rng = np.random.default_rng(seed=42)
