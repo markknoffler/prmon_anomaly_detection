@@ -1,16 +1,14 @@
-"""
-Training loop for TA-LSTM-AE.
-Features: tqdm bars, best-model checkpointing, early stopping, LR scheduler.
-"""
-import os, json, argparse
+import os
+import json
+import argparse
 import numpy as np
 import pandas as pd
 import torch
 import torch.optim as optim
 from tqdm import tqdm
 
-from model   import TA_LSTM_AE
-from loss    import sequence_normalised_mse
+from model import TA_LSTM_AE
+from loss import mse_loss
 from dataset import build_loaders, FEATURE_COLS
 
 DEFAULTS = dict(
@@ -32,13 +30,13 @@ def parse_args():
 def run_epoch(model, loader, optimizer, device, training):
     model.train() if training else model.eval()
     total = 0.0
-    ctx   = torch.enable_grad() if training else torch.no_grad()
-    bar   = tqdm(loader, desc="  train" if training else "  val", leave=False, ncols=88)
+    ctx = torch.enable_grad() if training else torch.no_grad()
+    bar = tqdm(loader, desc=" train" if training else " val  ", leave=False, ncols=88)
     with ctx:
-        for batch in bar:
+        for (batch,) in bar:
             batch = batch.to(device)
             recon, _ = model(batch)
-            loss = sequence_normalised_mse(batch, recon)
+            loss = mse_loss(batch, recon)
             if training:
                 optimizer.zero_grad()
                 loss.backward()
@@ -51,7 +49,8 @@ def run_epoch(model, loader, optimizer, device, training):
 
 def main():
     args = parse_args()
-    torch.manual_seed(args.seed); np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
     os.makedirs(args.out_dir, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -66,10 +65,10 @@ def main():
     )
 
     model = TA_LSTM_AE(len(FEATURE_COLS), args.hidden_dim, args.n_layers, args.dropout).to(device)
-    print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=7, factor=0.5, verbose=True)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=7, factor=0.5)
 
     best_val, patience_ctr, history = float("inf"), 0, []
     ckpt_path = os.path.join(args.out_dir, "best_model.pt")
@@ -83,15 +82,22 @@ def main():
 
         if va_loss < best_val:
             best_val, patience_ctr = va_loss, 0
-            torch.save({"epoch": epoch, "model_state": model.state_dict(),
-                        "val_loss": va_loss, "hparams": vars(args)}, ckpt_path)
+            torch.save({
+                "epoch": epoch,
+                "model_state": model.state_dict(),
+                "val_loss": va_loss,
+                "hparams": vars(args),
+            }, ckpt_path)
         else:
             patience_ctr += 1
             if patience_ctr >= args.patience:
-                tqdm.write(f"Early stop at epoch {epoch}"); break
+                tqdm.write(f"Early stop at epoch {epoch}")
+                break
 
-    pd.DataFrame(history).to_csv(os.path.join(args.out_dir, "training_history.csv"), index=False)
-    print(f"Done. Best val loss: {best_val:.6f}  |  Checkpoint: {ckpt_path}")
+    pd.DataFrame(history).to_csv(
+        os.path.join(args.out_dir, "training_history.csv"), index=False
+    )
+    print(f"Done. Best val_loss={best_val:.6f}  Checkpoint: {ckpt_path}")
 
 
 if __name__ == "__main__":

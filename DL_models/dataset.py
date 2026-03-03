@@ -1,97 +1,87 @@
-"""
-Data loading, run-level splitting, and sequence generation.
-
-Split (run-level to preserve temporal ordering):
-  Train : normal_mem_01, normal_mem_02, normal_mem_03, normal_mem_04
-  Val   : normal_cpu_01  (different behaviour - tests normal generalisation)
-  Test  : normal_io_01 + all 4 anomaly runs  (held out entirely)
-
-Why train only on normal?
-  ATLAS production jobs have no anomaly labels. The autoencoder learns normal
-  patterns from clean historical data; anything it cannot reconstruct is flagged.
-  Labels are used ONLY for evaluating detection quality, never for training.
-"""
-import os
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, TensorDataset
 from sklearn.preprocessing import StandardScaler
 import joblib
 
 FEATURE_COLS = [
-    "pss", "rss", "nthreads",
-    "utime", "stime",
-    "rchar", "wchar",
-    "dpss_dt", "cpu_eff",
-    "pss_per_proc", "io_rate",
+    "pss", "rss", "nthreads", "nprocs",
+    "utime", "stime", "rchar", "wchar",
+    "dpss_dt", "cpu_eff", "io_rate",
 ]
 
-TRAIN_RUNS = ["normal_mem_01", "normal_mem_02", "normal_mem_03"]
-VAL_RUNS   = ["normal_mem_04"]
-TEST_RUNS  = ["normal_cpu_01", "normal_io_01",
-              "anomaly_mem_spike", "anomaly_thread_spike",
-              "anomaly_combined",  "anomaly_io_burst"]
+NORMAL_TRAIN_RUNS = [
+    "normal_mem_01", "normal_mem_02", "normal_mem_03", "normal_mem_04",
+]
+
+TEST_RUNS = {
+    "normal_io_01":         {"label": 0, "anomaly_type": "io_normal"},
+    "normal_cpu_01":        {"label": 0, "anomaly_type": "cpu_normal"},
+    "anomaly_mem_spike":    {"label": 1, "anomaly_type": "mem_spike"},
+    "anomaly_thread_spike": {"label": 1, "anomaly_type": "thread_spike"},
+    "anomaly_io_burst":     {"label": 1, "anomaly_type": "io_burst"},
+    "anomaly_combined":     {"label": 1, "anomaly_type": "combined"},
+}
 
 
-def sliding_window(arr, seq_len):
+def sliding_windows(arr, seq_len):
     n = len(arr)
     if n < seq_len:
-        return np.empty((0, seq_len, arr.shape[1]))
-    return np.stack([arr[i:i + seq_len] for i in range(n - seq_len + 1)])
+        return np.empty((0, seq_len, arr.shape[1]), dtype=np.float32)
+    return np.stack([arr[i:i + seq_len] for i in range(n - seq_len + 1)], axis=0)
 
 
-class PrmonSeqDataset(Dataset):
-    def __init__(self, sequences):
-        self.X = torch.FloatTensor(sequences)
-    def __len__(self):
-        return len(self.X)
-    def __getitem__(self, idx):
-        return self.X[idx]
+def build_loaders(csv_path, seq_len=10, batch_size=32,
+                  scaler_save_path=None, val_frac=0.2, seed=42):
+    df = pd.read_csv(csv_path)
+    df = df.fillna(0.0)
 
-
-def build_loaders(csv_path, seq_len=10, batch_size=32, scaler_save_path=None):
-    df = pd.read_csv(csv_path).fillna(0)
-
+    train_mask = df["run_id"].isin(NORMAL_TRAIN_RUNS)
     scaler = StandardScaler()
-    train_df = df[df["run_id"].isin(TRAIN_RUNS)]
-    scaler.fit(train_df[FEATURE_COLS].values)
+    scaler.fit(df.loc[train_mask, FEATURE_COLS].values)
     if scaler_save_path:
-        os.makedirs(os.path.dirname(scaler_save_path), exist_ok=True)
         joblib.dump(scaler, scaler_save_path)
 
-    def runs_to_sequences(run_ids, tag):
-        parts = []
-        for rid in run_ids:
-            sub = df[df["run_id"] == rid].sort_values("wtime")
-            scaled = scaler.transform(sub[FEATURE_COLS].values)
-            seqs   = sliding_window(scaled, seq_len)
-            print(f"  {tag} | {rid}: {len(sub)} rows -> {len(seqs)} sequences")
-            if len(seqs) > 0:
-                parts.append(seqs)
-        return np.concatenate(parts) if parts else np.empty((0, seq_len, len(FEATURE_COLS)))
+    all_seqs = []
+    for rid in NORMAL_TRAIN_RUNS:
+        rdf = df[df["run_id"] == rid].sort_values("wtime")
+        scaled = scaler.transform(rdf[FEATURE_COLS].values).astype(np.float32)
+        seqs = sliding_windows(scaled, seq_len)
+        all_seqs.append(seqs)
 
-    print("\n[TRAIN]")
-    tr = runs_to_sequences(TRAIN_RUNS, "TRAIN")
-    print("[VAL]")
-    va = runs_to_sequences(VAL_RUNS, "VAL")
+    all_seqs = np.concatenate(all_seqs, axis=0)
 
-    print("[TEST]")
+    rng = np.random.default_rng(seed)
+    idx = rng.permutation(len(all_seqs))
+    split = int(len(idx) * (1 - val_frac))
+    tr_idx, va_idx = idx[:split], idx[split:]
+    tr_seqs, va_seqs = all_seqs[tr_idx], all_seqs[va_idx]
+
+    tr_loader = DataLoader(TensorDataset(torch.FloatTensor(tr_seqs)),
+                           batch_size=batch_size, shuffle=True,  drop_last=False)
+    va_loader = DataLoader(TensorDataset(torch.FloatTensor(va_seqs)),
+                           batch_size=batch_size, shuffle=False, drop_last=False)
+
     test_data = {}
-    for rid in TEST_RUNS:
-        sub = df[df["run_id"] == rid].sort_values("wtime")
-        if len(sub) == 0:
+    for rid, meta in TEST_RUNS.items():
+        rdf = df[df["run_id"] == rid].sort_values("wtime").reset_index(drop=True)
+        if len(rdf) == 0:
             continue
-        scaled = scaler.transform(sub[FEATURE_COLS].values)
-        seqs   = sliding_window(scaled, seq_len)
-        print(f"  TEST | {rid}: {len(sub)} rows -> {len(seqs)} sequences")
-        if len(seqs) > 0:
-            test_data[rid] = {
-                "sequences"   : seqs,
-                "label"       : int(sub["label"].iloc[0]),
-                "anomaly_type": sub["anomaly_type"].iloc[0],
-            }
+        scaled = scaler.transform(rdf[FEATURE_COLS].values).astype(np.float32)
+        seqs = sliding_windows(scaled, seq_len)
+        if len(seqs) == 0:
+            continue
+        wtimes = rdf["wtime"].values
+        seq_wtimes = [wtimes[i + seq_len - 1] for i in range(len(seqs))]
+        pss_vals = rdf["pss"].values
+        seq_pss = [pss_vals[i + seq_len - 1] for i in range(len(seqs))]
+        test_data[rid] = {
+            "sequences": seqs,
+            "label": meta["label"],
+            "anomaly_type": meta["anomaly_type"],
+            "seq_wtimes": np.array(seq_wtimes, dtype=np.float32),
+            "seq_pss": np.array(seq_pss, dtype=np.float32),
+        }
 
-    tr_loader = DataLoader(PrmonSeqDataset(tr), batch_size=batch_size, shuffle=True)
-    va_loader = DataLoader(PrmonSeqDataset(va), batch_size=batch_size, shuffle=False)
     return tr_loader, va_loader, test_data, scaler
