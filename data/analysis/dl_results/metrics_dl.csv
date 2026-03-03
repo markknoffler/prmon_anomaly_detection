@@ -1,0 +1,2 @@
+model,threshold,precision,recall,f1,roc_auc
+TA-LSTM-AE,0.0001802667829906568,0.7493,1.0,0.8567,0.3975
