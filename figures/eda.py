@@ -5,7 +5,7 @@ import matplotlib.patches as mpatches
 import seaborn as sns
 import os
 
-BASE = os.path.expanduser('/Users/samreedhbhuyan/Desktop/Win_C/CERN/PERMON/data/analysis')
+BASE = os.path.expanduser('/Users/samreedhbhuyan/Desktop/Win_C/CERN/PRMON/data/analysis')
 df = pd.read_csv(os.path.join(BASE, 'combined_dataset.csv'))
 FIG = os.path.join(BASE, 'figures')
 os.makedirs(FIG, exist_ok=True)

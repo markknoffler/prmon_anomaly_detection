@@ -15,16 +15,31 @@ os.makedirs(FIG, exist_ok=True)
 
 df = pd.read_csv(os.path.join(BASE, "combined_dataset.csv")).fillna(0.0)
 
+# ── Compute z-score against GLOBAL normal distribution ────────────────────────
+# Use μ and σ from normal runs only — this is the correct approach for
+# cross-run anomaly detection. Per-run rolling z-score (the precomputed
+# pss_zscore column) catches up to any level shift within ~5 timesteps,
+# making it blind to sustained anomalies like mem_spike.
+normal_pss = df[df["label"] == 0]["pss"]
+mu  = normal_pss.mean()
+std = normal_pss.std()
+
+df["global_zscore"] = (df["pss"] - mu) / std
+
 Z_THRESHOLD = 3.0
-df["pred_zscore"] = (np.abs(df["pss_zscore"]) > Z_THRESHOLD).astype(int)
-df["flag_type"]   = np.where(
+df["pred_zscore"] = (np.abs(df["global_zscore"]) > Z_THRESHOLD).astype(int)
+df["flag_type"] = np.where(
     (df["label"]==1) & (df["pred_zscore"]==1), "TP",
     np.where((df["label"]==0) & (df["pred_zscore"]==1), "FP",
     np.where((df["label"]==1) & (df["pred_zscore"]==0), "FN", "TN")))
 
-y = df["label"].values
+y      = df["label"].values
 preds  = df["pred_zscore"].values
-scores = np.abs(df["pss_zscore"].values)
+scores = np.abs(df["global_zscore"].values)
+
+print(f"Normal PSS — μ={mu:.0f} kB  σ={std:.0f} kB")
+print(f"3σ threshold = {mu + 3*std:.0f} kB  ({(mu + 3*std)/1024:.1f} MB)")
+print(f"anomaly_mem_spike PSS = 1,173,051 kB  → z = {(1173051 - mu)/std:.1f}σ")
 
 prec = precision_score(y, preds, zero_division=0)
 rec  = recall_score(y, preds, zero_division=0)
@@ -32,7 +47,7 @@ f1   = f1_score(y, preds, zero_division=0)
 auc  = roc_auc_score(y, scores)
 
 print("="*52)
-print(f"Z-Score Detector (PSS, threshold={Z_THRESHOLD}σ)")
+print(f"Z-Score Detector (global PSS, threshold={Z_THRESHOLD}σ)")
 print("="*52)
 print(classification_report(y, preds, target_names=["Normal", "Anomaly"]))
 print(f"ROC-AUC: {auc:.4f}")
@@ -48,27 +63,9 @@ pd.DataFrame([{
     "roc_auc":   round(auc,  4),
 }]).to_csv(os.path.join(BASE, "metrics_zscore.csv"), index=False)
 
+# Save with global_zscore replacing pss_zscore for plotting
+df["pss_zscore"] = df["global_zscore"]   # ← keeps figures.py working unchanged
 df[["run_id","wtime","pss","pss_zscore","label","pred_zscore",
     "anomaly_type","flag_type"]].to_csv(
     os.path.join(BASE, "results_zscore.csv"), index=False)
 
-ANOM_RUNS = [r for r in df["run_id"].unique() if df[df["run_id"]==r]["label"].iloc[0]==1]
-fig, axes = plt.subplots(len(ANOM_RUNS), 2, figsize=(14, 3.5*len(ANOM_RUNS)), facecolor="white")
-for row, rid in enumerate(ANOM_RUNS):
-    g = df[df["run_id"]==rid].sort_values("wtime")
-    ax_pss, ax_z = axes[row]
-    ax_pss.plot(g["wtime"], g["pss"]/1024, "#EF4444", lw=1.8)
-    ax_pss.fill_between(g["wtime"], g["pss"]/1024, alpha=0.1, color="#EF4444")
-    ax_pss.set_title(rid, fontsize=10, fontweight="bold")
-    ax_pss.set_ylabel("PSS (MB)"); ax_pss.set_xlabel("Wall-time (s)")
-    ax_pss.grid(alpha=0.25)
-    ax_z.plot(g["wtime"], np.abs(g["pss_zscore"]), "#2563EB", lw=1.8, label="|Z-score|")
-    ax_z.axhline(Z_THRESHOLD, color="#DC2626", ls="--", lw=2, label=f"{Z_THRESHOLD}σ threshold")
-    ax_z.set_ylabel("|Z-score|"); ax_z.set_xlabel("Wall-time (s)")
-    ax_z.set_ylim(0, max(4.5, np.abs(g["pss_zscore"]).max()*1.1))
-    ax_z.grid(alpha=0.25); ax_z.legend(fontsize=9)
-plt.suptitle("Z-Score Detector: PSS and |Z-score| per Anomaly Run", fontsize=12, fontweight="bold", y=1.01)
-plt.tight_layout(pad=2.0)
-plt.savefig(os.path.join(FIG, "04_zscore_flags.png"), dpi=150, bbox_inches="tight")
-plt.close()
-print("Saved: results_zscore.csv  metrics_zscore.csv  04_zscore_flags.png")

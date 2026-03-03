@@ -1,2 +1,2 @@
 model,precision,recall,f1,roc_auc
-Z-Score,0.0,0.0,0.0,0.4043
+Z-Score,1.0,0.6341,0.7761,0.9184
