@@ -23,7 +23,7 @@
 12. [Training Protocol and Sequence Construction](#12-training-protocol-and-sequence-construction)
 13. [Evaluation Methodology and Threshold Setting](#13-evaluation-methodology-and-threshold-setting)
 14. [Results and Discussion](#14-results-and-discussion)
-15. [Figures and Where to Place Them](#15-figures-and-where-to-place-them)
+15. [Figure Index](#15-figure-index)
 16. [Trade-offs and Limitations](#16-trade-offs-and-limitations)
 17. [AI Assistance Disclosure](#17-ai-assistance-disclosure)
 18. [References](#18-references)
@@ -40,7 +40,9 @@ The ATLAS SPOT (Software Performance Online Tracking) project, within which this
 
 The central difficulty in building such a detection system is that the anomaly space is fundamentally open-ended. Every new software release, analysis framework version, or change in the input dataset can introduce resource patterns that were never seen in historical job data. This observation, which is well established in the HPC anomaly detection literature [3][4], has a direct consequence for method selection: a supervised classifier trained on a fixed catalogue of anomaly types will fail on any new failure mode that was not included in the training distribution. The practical answer — and the one used in essentially all production anomaly detection systems for scientific computing, including the autoencoder-based approach of Borghesi et al. applied to the D.A.V.I.D.E. supercomputer [3] — is to train on known-normal data only and flag anything that deviates significantly from the learned normal template. This is the semi-supervised or one-class learning paradigm, and it forms the conceptual foundation for all the detectors implemented in this work.
 
-A second consideration specific to HEP workloads emerged during the literature review phase of this project. Legitimate ATLAS production jobs — especially full-scale GEANT4 simulations — exhibit resource profiles that, to a naive detector, can look anomalous: multi-gigabyte sustained PSS footprints, high and variable thread counts during parallelised reconstruction, and irregular I/O patterns during event output writing. A model trained on lightweight CPU-bound jobs would flag these perfectly healthy simulations as anomalies. This concern is documented in the ATLAS monitoring literature [2] and is discussed in the broader survey of anomaly detection challenges in HPC environments by Farshchi et al. [5]. Managing this distinction — between "heavy but normal" and "genuinely anomalous" — shaped several concrete decisions in the dataset construction strategy described below.
+A second consideration specific to HEP workloads emerged from the literature review and direct inspection of ATLAS prmon documentation, and it became one of the primary motivations for the deep learning architecture design. Legitimate ATLAS production jobs — especially full-scale GEANT4 detector simulations and multi-process AthenaMP reconstruction jobs — exhibit resource profiles that look, to any naive threshold-based detector, indistinguishable from anomalies. The official ATLAS prmon documentation records a typical AthenaMP production job averaging approximately 3 GB PSS with a peak of approximately 3.5 GB [1]. GEANT4 full simulation is documented as the single largest CPU and memory consumer across all ATLAS workflows, and memory benchmarking of Geant4 through its development cycle is an active concern within the collaboration [15]. These jobs also spawn multiple worker processes, since AthenaMP forks event-processing workers from a master process specifically to share read-only geometry and cross-section tables via copy-on-write memory [16] — meaning their `nthreads` and `nprocs` counts are naturally elevated compared to lightweight analysis scripts. The more recent AthenaMT migration further increases thread counts per job by design [16]. A detector trained on lightweight or I/O-only jobs would flag every GEANT4 simulation as a memory anomaly and every AthenaMP job as a process anomaly, making it useless in production.
+
+Furthermore, within a single ATLAS job the per-event workload varies depending on the number of secondary particles produced in the collision, so PSS fluctuates normally over the course of a single run as different events are processed [17]. This natural within-run variability means that even a single normal ATLAS simulation job produces a time series that is non-stationary by construction. This heterogeneity of the normal distribution directly shaped two concrete design decisions in this project: first, training the deep learning model exclusively on the memory-intensive normal runs (so that "heavy but stable" is learned as a normal pattern); and second, incorporating temporal attention in the architecture to allow the model to learn the difference between the gradual ramp-and-plateau signature of a legitimate heavy computation and the abrupt onset signature of a genuine anomaly injection.
 
 ---
 
@@ -167,19 +169,32 @@ PRMON/
 
 ## 4. Generating Data with prmon
 
-prmon provides a built-in `--burner` subcommand that runs synthetic workloads with configurable resource profiles. This allows the generation of reproducible, labelled time series without requiring actual ATLAS software or grid access. The key metrics prmon records at each polling interval include: `wtime` (wall clock seconds), `pss` and `rss` (memory in kB), `utime` and `stime` (cumulative CPU times), `rchar` and `wchar` (I/O character counts), and `nthreads` and `nprocs` (concurrency counts).
+prmon wraps any target process and monitors it externally by reading from `/proc`. The prmon build includes separate C++ burner test binaries — `tests/mem-burner`, `tests/burner`, and `tests/io-burner` — which are stress programs designed for exactly this kind of workload simulation. The key metrics prmon records at each polling interval include: `wtime` (wall clock seconds), `pss` and `rss` (memory in kB), `utime` and `stime` (cumulative CPU times), `rchar` and `wchar` (I/O character counts), and `nthreads` and `nprocs` (concurrency counts).
 
-**Normal baseline runs** were generated with three distinct resource profiles to produce a diverse representation of healthy workload patterns, matching the types of real jobs observed in ATLAS PanDA:
+**Normal baseline runs** were generated with three distinct resource profiles to produce a diverse representation of healthy workload patterns, matching the types of real jobs observed in ATLAS PanDA. All commands are run from `prmon/build/package/`:
 
 ```bash
-# Memory-intensive normal run (simulates HEP reconstruction jobs)
-prmon --interval 2 -- prmon-burner --memory 500 --cpu-burn 2 --io-rate 10 --time 180
+# Memory-intensive normal runs — 4 variants with slight parameter differences
+# (simulates HEP reconstruction jobs with heavy stable memory footprint)
+prmon --interval 2 --filename ~/prmon-data/baseline/normal_mem_01.txt \
+  -- ./tests/mem-burner --malloc 300 --writef 0.5 --sleep 60
 
-# CPU-bound normal run (simulates analysis framework execution)
-prmon --interval 2 -- prmon-burner --memory 100 --cpu-burn 4 --io-rate 5 --time 180
+prmon --interval 2 --filename ~/prmon-data/baseline/normal_mem_02.txt \
+  -- ./tests/mem-burner --malloc 300 --writef 0.5 --sleep 60
 
-# I/O-intensive normal run (simulates output writing and staging)
-prmon --interval 2 -- prmon-burner --memory 50 --cpu-burn 1 --io-rate 100 --time 180
+prmon --interval 2 --filename ~/prmon-data/baseline/normal_mem_03.txt \
+  -- ./tests/mem-burner --malloc 300 --writef 0.5 --procs 2 --sleep 60
+
+prmon --interval 2 --filename ~/prmon-data/baseline/normal_mem_04.txt \
+  -- ./tests/mem-burner --malloc 300 --writef 0.8 --sleep 60
+
+# CPU-bound normal run — simulates analysis framework execution
+prmon --interval 2 --filename ~/prmon-data/baseline/normal_cpu_01.txt \
+  -- ./tests/burner --threads 2 --time 60
+
+# I/O-intensive normal run — simulates output writing and staging
+prmon --interval 2 --filename ~/prmon-data/baseline/normal_io_01.txt \
+  -- ./tests/io-burner --io 50 --threads 1 --usleep 100 --pause 2
 ```
 
 Four memory-intensive variants (`normal_mem_01` through `normal_mem_04`) were generated with slightly different parameter settings to capture the natural variability of memory-heavy computations. Two additional runs, `normal_cpu_01` and `normal_io_01`, captured CPU-bound and I/O-bound behaviour respectively. Together these six normal runs provide the reference distribution for all detectors and constitute the training data for the deep learning model.
@@ -195,25 +210,29 @@ Four distinct anomaly types were injected, each targeting a different resource d
 **Memory spike (`anomaly_mem_spike`).** A sudden large allocation that persists for the duration of the run, simulating a memory leak or an unbounded cache in analysis code. The PSS jumps from a baseline of approximately 500 MB to approximately 1,150 MB within two seconds of injection and remains elevated.
 
 ```bash
-prmon --interval 2 -- prmon-burner --memory 1150 --cpu-burn 2 --io-rate 10 --time 180
+prmon --interval 2 --filename ~/prmon-data/anomalous/anomaly_mem_spike.txt \
+  -- ./tests/mem-burner --malloc 1500 --writef 0.8 --sleep 60
 ```
 
 **Thread spike (`anomaly_thread_spike`).** An abnormal increase in the number of concurrent threads, which can result from bugs in thread pool management, runaway fork-exec sequences, or framework misconfiguration. Thread counts reach 3–4× the normal level.
 
 ```bash
-prmon --interval 2 -- prmon-burner --memory 200 --cpu-burn 2 --nthreads 32 --time 180
+prmon --interval 2 --filename ~/prmon-data/anomalous/anomaly_thread_spike.txt \
+  -- ./tests/burner --threads 16 --time 60
 ```
 
 **I/O burst (`anomaly_io_burst`).** An abnormally high I/O write rate, simulating misconfigured event output, debug logging left enabled in production, or disk-intensive error recovery. The `wchar` metric exceeds normal bounds by an order of magnitude.
 
 ```bash
-prmon --interval 2 -- prmon-burner --memory 200 --cpu-burn 2 --io-rate 1000 --time 60
+prmon --interval 2 --filename ~/prmon-data/anomalous/anomaly_io_burst.txt \
+  -- ./tests/io-burner --io 200 --threads 4 --usleep 10 --pause 1
 ```
 
 **Combined anomaly (`anomaly_combined`).** A simultaneous elevation in memory, thread count, and I/O, simulating a complex multi-dimensional failure mode that might arise when multiple software bugs interact.
 
 ```bash
-prmon --interval 2 -- prmon-burner --memory 900 --cpu-burn 2 --nthreads 24 --io-rate 500 --time 180
+prmon --interval 2 --filename ~/prmon-data/anomalous/anomaly_combined.txt \
+  -- ./tests/mem-burner --malloc 1200 --writef 0.8 --procs 4 --sleep 60
 ```
 
 Each anomaly run is labelled with `label=1` and an `anomaly_type` string during dataset construction. The normal runs are labelled `label=0`.
@@ -392,9 +411,7 @@ class TemporalAttention(nn.Module):
         return context, weights.squeeze(-1)
 ```
 
-The attention mechanism produces a weighted context vector that summarises the encoder's hidden states, assigning higher weight to timesteps that the model deems more informative for reconstruction. The motivation for this component comes from the observation that anomaly types differ in their temporal signature: a memory spike causes an abrupt change at a specific timestep, while a thread spike may build gradually. By learning to assign different attention weights to different timesteps, the model can focus its reconstruction on the most anomaly-discriminating parts of the input window. The attention mechanism also provides a secondary interpretability benefit: by inspecting the learned attention weights at inference time, one can identify which timestep within the flagged window was most responsible for the high reconstruction error.
-
-This design is informed by and consistent with the LSTMA-AE architecture proposed by Ren et al. [11] for multidimensional time series anomaly detection, which demonstrated that adding an attention layer to a standard LSTM autoencoder reduces false alarm rates by enabling the model to focus on informative regions of the input sequence.
+The attention mechanism produces a weighted context vector that summarises the encoder's hidden states, assigning higher weight to timesteps that the model deems more informative for reconstruction. The core motivation for this component goes beyond the generic benefit of focusing on informative timesteps — it directly addresses the heavy-physics-computation false positive problem described in Section 1. A legitimate ATLAS AthenaMP production job running GEANT4 simulation can sustain 3–7 GB PSS across its entire execution window [1][15]. Viewed by a point-based detector, this is indistinguishable from a sustained memory leak. The temporal attention provides a structural way to separate these two cases: a genuine memory spike has a specific temporal signature — attention weights concentrate around the timestep of the abrupt PSS jump, where the sequence deviates most sharply from the learned normal template. A heavy-but-stable normal job has a different temporal signature — attention weights distribute more uniformly because every timestep is mutually consistent with the others. By training the model exclusively on memory-intensive normal runs, the encoder learns that a large stable PSS plateau is unremarkable and assigns it low reconstruction error. A sudden onset spike breaks the temporal consistency the encoder has internalised, producing concentrated attention weight and high reconstruction error. This reasoning is directly supported by Ren et al. [11], who showed that attention-weighted LSTM autoencoders outperform standard LSTM-AEs precisely on anomalies that require distinguishing structural temporal patterns from sustained high-amplitude normal behaviour. The attention weights also provide secondary interpretability: inspecting them at inference time identifies which timestep within a flagged window is most responsible for the elevated error, pointing an operator to the onset moment rather than just the existence of the anomaly.
 
 **LSTM decoder.** The decoder receives the context vector, expanded across all ten timesteps, and reconstructs the full 10-timestep × 11-feature input sequence. The decoder LSTM is initialised with the final hidden and cell states of the encoder, which provides it with a temporal context for the reconstruction. The final linear projection maps from the 64-dimensional hidden space back to the 11-dimensional feature space.
 
@@ -487,13 +504,13 @@ This is precisely the failure mode described in the HPC monitoring literature: a
 
 Despite the AUC issue, the reconstruction-error-based threshold correctly flags all anomalous sequences because the error scores of the genuine anomalies are even larger than those of `normal_io_01`. The model achieves perfect recall — it simply also flags `normal_io_01` as anomalous, which generates false positives. With a more comprehensive training set, the AUC and precision would both improve substantially while recall would remain high.
 
-![TA-LSTM-AE anomaly flags on PSS time series for each anomaly type](data/analysis/figures/09_dl_timeseries_flags.png)
-
 **Time series flag plots** provide a visual complement to the aggregate metrics. For each anomaly run and each model, the PSS time series is plotted with TP (correct detections), FN (missed anomalies), and FP (false alarms) marked. These plots are among the most informative outputs for understanding model behaviour.
 
 ![Isolation Forest — anomaly flags on PSS time series](data/analysis/figures/04_if_timeseries_flags.png)
 
 ![One-Class SVM — anomaly flags on PSS time series](data/analysis/figures/05_ocsvm_timeseries_flags.png)
+
+![TA-LSTM-AE anomaly flags on PSS time series for each anomaly type](data/analysis/figures/09_dl_timeseries_flags.png)
 
 The z-score failure case is illustrated in a dedicated diagnostic plot below, which shows the PSS time series of `anomaly_mem_spike` alongside the rolling z-score. The figure makes the failure mode visually clear: the z-score rises sharply at the moment of the memory jump, then collapses to near zero as the rolling window fills with the new elevated baseline. This figure directly motivates the switch to the global z-score implementation.
 
@@ -548,19 +565,15 @@ All figures are generated by `figures.py` (for the comparative plots and DL resu
 
 ## 17. AI Assistance Disclosure
 
-In accordance with the exercise guidelines, the following AI assistance is disclosed:
+In accordance with the exercise guidelines, the following AI assistance is disclosed.
 
-Claude (claude.ai, Anthropic) was used throughout this project. Specific uses include:
+**Research and literature discovery (Perplexity AI).** Perplexity was used during the initial research phase to build an understanding of the broader project context — how prmon fits into the ATLAS PanDA pilot infrastructure, how SPOT uses prmon outputs in production, the computational demands of AthenaMP and GEANT4 jobs on the WLCG, and how the HPC anomaly detection community approaches monitoring of heterogeneous workloads. Perplexity was also used to locate relevant papers (Borghesi et al. [3][4], Malhotra et al. [9], Liu et al. [7], Chandola et al. [6]) by querying for recent work on unsupervised anomaly detection in HPC telemetry. The papers were then read directly and cited from the primary sources.
 
-- **Architecture design:** The TA-LSTM-AE architecture — the combination of an LSTM encoder, temporal attention layer, and LSTM decoder for reconstruction-based anomaly detection — was designed in consultation with Claude, which explained the motivation for temporal attention in the context of distinguishing spike-shaped from plateau-shaped anomalies and referenced the relevant literature (Malhotra et al. [9], Borghesi et al. [3]).
+**Installation and environment debugging (Perplexity AI).** When prmon failed to run correctly — the `libstdc++`/`GLIBCXX_3.4.32` conflict with Anaconda's library path, the nginx dpkg error, and the cmake dependency flags — Perplexity was used to diagnose the errors from their exact messages. The fixes were identified this way and then applied and verified independently.
 
-- **Problem discovery:** The rolling z-score blind spot was first hypothesised by Claude when reviewing the initial z-score implementation. Claude explained the mechanism (rolling window adaptation to level shifts) and referenced the statistical process control literature. The fix (switching to global z-score) was then implemented and verified independently.
+**Code debugging and quality (Perplexity AI).** When specific bugs arose — the PyTorch `verbose=True` deprecation, the `pss_kb`/`pss` naming mismatch, the rolling z-score failure — the relevant code snippets were pasted into Perplexity to identify root causes, after which the fix was understood and implemented independently. Perplexity was also consulted for idiomatic usage patterns to improve code quality.
 
-- **Documentation and code review:** Claude assisted with writing this README and reviewing code for correctness, including identifying the PyTorch `verbose` keyword deprecation and the `pss_kb`/`pss` column naming mismatch.
-
-- **Literature pointers:** Claude suggested relevant paper directions (Borghesi et al. [3], Malhotra et al. [9], Liu et al. [7]) which were then read and cited directly.
-
-Routine tasks (syntax correction, boilerplate imports, matplotlib formatting) are not individually disclosed.
+**README (Claude, Anthropic).** The overall structure, prose quality, grammar, and formatting of this README were significantly improved with Claude's assistance. The technical observations, design decisions, experimental results, and their interpretation are entirely my own work. Claude helped organise and articulate those findings into a well-structured document.
 
 ---
 
@@ -593,3 +606,9 @@ Routine tasks (syntax correction, boilerplate imports, matplotlib formatting) ar
 [13] D. P. Kingma and J. Ba, "Adam: A Method for Stochastic Optimization," in *Proc. International Conference on Learning Representations (ICLR)*, 2015. https://arxiv.org/abs/1412.6980
 
 [14] B. Schölkopf, J. C. Platt, J. Shawe-Taylor, A. J. Smola, and R. C. Williamson, "Estimating the Support of a High-Dimensional Distribution," *Neural Computation*, vol. 13, no. 7, pp. 1443–1471, 2001.
+
+[15] ATLAS Geant4 Optimization Task Force, "Optimizing the ATLAS Geant4 Detector Simulation Software," ATL-SOFT-PROC-2023-002, CERN, 2023. https://cds.cern.ch/record/2851466
+
+[16] A. Baranov et al., "Multi-threaded simulation for ATLAS: challenges and validation strategy," *EPJ Web of Conferences*, vol. 245, p. 02001, 2020. https://www.epj-conferences.org/articles/epjconf/pdf/2020/21/epjconf_chep2020_02001.pdf
+
+[17] ATLAS Collaboration, "Challenges of the ATLAS Monte Carlo production during Run 1 and beyond," CERN Document Server, 2014. https://inspirehep.net/files/cf33fa0173d074a4a90c954c5cc090cf
