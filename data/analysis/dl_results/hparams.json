@@ -1,0 +1,13 @@
+{
+  "csv": "../data/analysis/combined_dataset.csv",
+  "out_dir": "../data/analysis/dl_results",
+  "seq_len": 10,
+  "batch_size": 32,
+  "hidden_dim": 64,
+  "n_layers": 2,
+  "dropout": 0.2,
+  "epochs": 100,
+  "lr": 0.001,
+  "patience": 15,
+  "seed": 42
+}
